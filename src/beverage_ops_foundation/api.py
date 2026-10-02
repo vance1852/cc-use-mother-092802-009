@@ -10,17 +10,26 @@ from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
 from .service import DomainService
+from .snapshot.http import route_snapshot
+from .snapshot.schema import SNAPSHOT_SCHEMA
+from .snapshot.service import SnapshotService
 from .storage import Database
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None,
+          snapshot_service: SnapshotService | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
     body = body or {}
     parsed = urlparse(path)
     actor_id = headers.get("X-Actor-Id", "")
+    if parsed.path.split("/")[1:2] == ["snapshot"]:
+        snapshot = snapshot_service or SnapshotService(service.database)
+        snapshot_result = route_snapshot(snapshot, method, path, body, headers)
+        if snapshot_result is not None:
+            return snapshot_result
     try:
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
@@ -59,6 +68,7 @@ class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    snapshot_service: SnapshotService
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -69,7 +79,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
         status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")},
+                                getattr(self, "snapshot_service", None))
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -93,13 +104,14 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     """启动本地 HTTP 服务。"""
 
-    parser = argparse.ArgumentParser(description="启动技能赛训协作基础服务")
+    parser = argparse.ArgumentParser(description="启动组合经营快照基础服务")
     parser.add_argument("--database", default="service.sqlite3")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
-    database = Database(args.database)
+    database = Database(args.database, extra_schema=SNAPSHOT_SCHEMA)
     Handler.service = DomainService(database)
+    Handler.snapshot_service = SnapshotService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
